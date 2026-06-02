@@ -227,6 +227,21 @@ def load_data(raw_bytes: bytes, filename: str) -> pd.DataFrame:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip().replace("nan", "")
 
+    # Retirer les "????" et emojis dans les noms (Affiliate, Account)
+    def _clean_name(s: str) -> str:
+        import unicodedata as _ud
+        out = "".join(
+            c for c in str(s)
+            if _ud.category(c) not in ("So", "Sk", "Cs", "Co")  # emojis/surrogates
+            and not (0x1F300 <= ord(c) <= 0x1FAFF)               # plage emoji étendue
+        )
+        out = re.sub(r"\?+", "", out).strip()
+        return out or s.strip()
+
+    for col in ["Affiliate", "Account"]:
+        if col in df.columns:
+            df[col] = df[col].apply(_clean_name)
+
     # Normaliser Statut
     if "Statut" in df.columns:
         df["Statut"] = df["Statut"].str.lower().str.strip()
@@ -533,6 +548,81 @@ def send_email(smtp_host: str, smtp_port: int, smtp_user: str,
         return False
 
 
+# ─────────────────────────────────────────────
+# INTEGRATIONS — META & LEADFLOW
+# ─────────────────────────────────────────────
+
+def fetch_meta_campaigns(access_token: str, ad_account_id: str) -> pd.DataFrame:
+    """Récupère les campagnes Meta Ads via l'API Graph."""
+    account = ad_account_id.lstrip("act_")
+    url = f"https://graph.facebook.com/v20.0/act_{account}/campaigns"
+    params = {
+        "fields": (
+            "id,name,status,daily_budget,lifetime_budget,budget_remaining,"
+            "insights.date_preset(last_30d){spend,impressions,clicks,cpc,cpm,ctr,"
+            "actions,cost_per_action_type}"
+        ),
+        "access_token": access_token,
+        "limit": 200,
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        data = resp.json()
+        if "error" in data:
+            return None, data["error"].get("message", "Erreur inconnue")
+        campaigns = data.get("data", [])
+        rows = []
+        for c in campaigns:
+            ins = c.get("insights", {}).get("data", [{}])[0] if c.get("insights") else {}
+            spend   = float(ins.get("spend", 0) or 0)
+            clicks  = int(ins.get("clicks", 0) or 0)
+            impr    = int(ins.get("impressions", 0) or 0)
+            cpc     = float(ins.get("cpc", 0) or 0)
+            ctr     = float(ins.get("ctr", 0) or 0)
+            # Leads / conversions
+            actions = ins.get("actions", []) or []
+            leads   = sum(int(a.get("value", 0)) for a in actions
+                          if "lead" in a.get("action_type", ""))
+            budget_rem = float(c.get("budget_remaining", 0) or 0) / 100
+            daily_b    = float(c.get("daily_budget", 0) or 0) / 100
+            lifetime_b = float(c.get("lifetime_budget", 0) or 0) / 100
+            rows.append({
+                "Campagne":        c.get("name", ""),
+                "ID Meta":         c.get("id", ""),
+                "Statut Meta":     c.get("status", ""),
+                "Budget quotidien":daily_b,
+                "Budget lifetime": lifetime_b,
+                "Budget restant":  budget_rem,
+                "Dépenses (€)":    spend,
+                "Impressions":     impr,
+                "Clics":           clicks,
+                "CTR (%)":         round(ctr, 2),
+                "CPC (€)":         round(cpc, 2),
+                "Leads":           leads,
+                "CPL (€)":         round(spend / leads, 2) if leads > 0 else np.nan,
+            })
+        return pd.DataFrame(rows), None
+    except Exception as e:
+        return None, str(e)
+
+
+def fetch_leadflow_campaigns(api_key: str, base_url: str) -> pd.DataFrame:
+    """Récupère les campagnes Leadflow / Cardata via leur API REST."""
+    headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+    endpoint = base_url.rstrip("/") + "/api/v1/campaigns"
+    try:
+        resp = requests.get(endpoint, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return None, f"HTTP {resp.status_code} — {resp.text[:200]}"
+        data = resp.json()
+        # Normalise quelle que soit la structure retournée (liste ou {data: [...]})
+        rows = data if isinstance(data, list) else data.get("data", data.get("campaigns", []))
+        df_lf = pd.json_normalize(rows)
+        return df_lf, None
+    except Exception as e:
+        return None, str(e)
+
+
 def build_alert_message(alerts: dict) -> str:
     lines = [f"🔔 *Campaign Tracker — Alertes du {date.today().strftime('%d/%m/%Y')}*\n"]
 
@@ -707,8 +797,8 @@ if st.session_state.get("send_alerts"):
 total_alerts = len(alerts["danger"]) + len(alerts["warning"]) + len(alerts["publisher"])
 alert_label = f"🔔 Alertes ({total_alerts})" if total_alerts else "🔔 Alertes"
 
-tab_overview, tab_campaigns, tab_alerts, tab_publisher, tab_edit = st.tabs(
-    ["🏠 Vue d'ensemble", "📋 Campagnes", alert_label, "💡 Éditeurs", "✏️ Édition"]
+tab_overview, tab_campaigns, tab_alerts, tab_publisher, tab_edit, tab_integrations = st.tabs(
+    ["🏠 Vue d'ensemble", "📋 Campagnes", alert_label, "💡 Éditeurs", "✏️ Édition", "🔌 Intégrations"]
 )
 
 
@@ -857,33 +947,148 @@ with tab_overview:
                 fig3.update_layout(height=300, margin=dict(t=40, b=0))
                 st.plotly_chart(fig3, use_container_width=True)
 
-    # Budget pace scatter
+    # ── Graphique Rythme budgétaire ────────────────────────────────────────
     if "Pct_Budget" in df.columns and "Pct_Temps" in df.columns:
-        st.subheader("Rythme budgétaire (% Budget vs % Temps passé)")
+        st.subheader("📈 Rythme budgétaire")
+
+        # Filtres du graphique
+        gf1, gf2, gf3, gf4, gf5 = st.columns(5)
+        with gf1:
+            g_mode = st.selectbox("Mode d'affichage", [
+                "🔵 Scatter (bulles)", "📊 Barres % Budget", "🌡️ Heatmap Levier × Statut",
+                "📉 Courbe tendance", "📋 Tableau"], key="g_mode")
+        with gf2:
+            g_color = st.selectbox("Couleur par", ["Retard", "Levier", "Statut", "Affiliate", "Géo", "Modèle"],
+                                   key="g_color")
+        with gf3:
+            g_size = st.selectbox("Taille bulle par", ["Budget", "Marge_€", "Volume_réalisé", "Aucune"],
+                                  key="g_size")
+        with gf4:
+            g_leviers = st.multiselect("Levier", sorted(df["Levier"].dropna().unique()),
+                                       default=[], key="g_lev")
+        with gf5:
+            g_statuts = st.multiselect("Statut", sorted(df["Statut"].dropna().unique()),
+                                       default=[], key="g_stat")
+
+        # Préparer les données
         pace = df[df["Pct_Budget"].notna() & df["Pct_Temps"].notna()].copy()
         pace = pace[~pace["Pct_Temps"].astype(str).str.lower().isin(["finie", "nan"])]
-        if not pace.empty:
-            pace["Pct_Temps_num"] = pd.to_numeric(pace["Pct_Temps"], errors="coerce")
-            pace = pace[pace["Pct_Temps_num"].notna()]
-            pace["Retard"] = pace["Pct_Budget"] - pace["Pct_Temps_num"]
+        pace["Pct_Temps_num"] = pd.to_numeric(pace["Pct_Temps"], errors="coerce")
+        pace = pace[pace["Pct_Temps_num"].notna()].copy()
+        pace["Retard"] = pace["Pct_Budget"] - pace["Pct_Temps_num"]
 
-            hov_pace = [c for c in ["Campagne", "Levier", "Budget_restant"]
-                        if c in pace.columns]
-            fig4 = px.scatter(
-                pace,
-                x="Pct_Temps_num", y="Pct_Budget",
-                text="Campagne",
-                color="Retard",
-                color_continuous_scale="RdYlGn",
-                labels={"Pct_Temps_num": "% Temps passe", "Pct_Budget": "% Budget utilise"},
-                hover_data=hov_pace,
-            )
-            fig4.add_shape(type="line", x0=0, y0=0, x1=150, y1=150,
-                           line=dict(color="gray", dash="dash"))
-            fig4.update_traces(textposition="top center", textfont_size=8)
-            fig4.update_layout(height=420, margin=dict(t=10))
-            st.plotly_chart(fig4, use_container_width=True)
-            st.caption("Points au-dessus de la diagonale = budget consommé plus vite que le temps écoulé")
+        if g_leviers: pace = pace[pace["Levier"].isin(g_leviers)]
+        if g_statuts: pace = pace[pace["Statut"].isin(g_statuts)]
+
+        if pace.empty:
+            st.info("Aucune donnée pour ces filtres.")
+        else:
+            color_col = g_color if g_color in pace.columns else "Retard"
+            hov_cols  = [c for c in ["Campagne", "Levier", "Statut", "Budget_restant",
+                                     "Marge_pct", "Affiliate"] if c in pace.columns]
+
+            # ── Mode Scatter ──────────────────────────────────────────────
+            if g_mode == "🔵 Scatter (bulles)":
+                size_col = None
+                if g_size != "Aucune" and g_size in pace.columns:
+                    med = pace[g_size].median()
+                    med = med if pd.notna(med) and med > 0 else 1
+                    pace["_sz"] = pace[g_size].fillna(med).clip(lower=1)
+                    size_col = "_sz"
+
+                fig4 = px.scatter(
+                    pace, x="Pct_Temps_num", y="Pct_Budget",
+                    color=color_col,
+                    size=size_col, size_max=45,
+                    text="Campagne",
+                    hover_name="Campagne", hover_data=hov_cols,
+                    color_continuous_scale="RdYlGn" if color_col == "Retard" else None,
+                    color_discrete_sequence=px.colors.qualitative.Bold if color_col != "Retard" else None,
+                    labels={"Pct_Temps_num": "% Temps ecoule", "Pct_Budget": "% Budget utilise",
+                            "_sz": g_size},
+                )
+                fig4.add_shape(type="line", x0=0, y0=0, x1=150, y1=150,
+                               line=dict(color="gray", dash="dash", width=1))
+                fig4.add_shape(type="line", x0=80, y0=0, x1=80, y1=150,
+                               line=dict(color=COLOR_WARN, dash="dot", width=1))
+                fig4.add_shape(type="line", x0=0, y0=95, x1=150, y1=95,
+                               line=dict(color=COLOR_DANGER, dash="dot", width=1))
+                fig4.update_traces(textposition="top center", textfont_size=7)
+                fig4.update_layout(height=480, margin=dict(t=20))
+                st.plotly_chart(fig4, use_container_width=True)
+                st.caption("Diagonale grise = rythme idéal · Pointillé orange = 80% temps · Pointillé rouge = 95% budget")
+
+            # ── Mode Barres ────────────────────────────────────────────────
+            elif g_mode == "📊 Barres % Budget":
+                bar_data = pace.sort_values("Pct_Budget", ascending=False).head(40)
+                fig4 = px.bar(
+                    bar_data, x="Campagne", y="Pct_Budget",
+                    color=color_col,
+                    hover_data=hov_cols,
+                    color_continuous_scale="RdYlGn_r" if color_col == "Retard" else None,
+                    color_discrete_sequence=px.colors.qualitative.Bold if color_col != "Retard" else None,
+                    labels={"Pct_Budget": "% Budget utilise"},
+                    title="% Budget consommé par campagne (Top 40)",
+                )
+                fig4.add_hline(y=80,  line_dash="dot", line_color=COLOR_WARN,
+                               annotation_text="Seuil 80%")
+                fig4.add_hline(y=100, line_dash="dot", line_color=COLOR_DANGER,
+                               annotation_text="100%")
+                fig4.update_layout(height=450, xaxis_tickangle=-45)
+                st.plotly_chart(fig4, use_container_width=True)
+
+            # ── Mode Heatmap ────────────────────────────────────────────────
+            elif g_mode == "🌡️ Heatmap Levier × Statut":
+                if "Levier" in pace.columns and "Statut" in pace.columns:
+                    heat = pace.groupby(["Levier", "Statut"])["Pct_Budget"].mean().reset_index()
+                    heat_pivot = heat.pivot(index="Levier", columns="Statut", values="Pct_Budget")
+                    fig4 = go.Figure(go.Heatmap(
+                        z=heat_pivot.values,
+                        x=heat_pivot.columns.tolist(),
+                        y=heat_pivot.index.tolist(),
+                        colorscale="RdYlGn_r",
+                        text=[[f"{v:.0f}%" if not np.isnan(v) else "" for v in row]
+                              for row in heat_pivot.values],
+                        texttemplate="%{text}",
+                        colorbar=dict(title="% Budget moy."),
+                    ))
+                    fig4.update_layout(
+                        title="% Budget moyen — Levier × Statut",
+                        height=380, margin=dict(t=40),
+                        xaxis_title="Statut", yaxis_title="Levier",
+                    )
+                    st.plotly_chart(fig4, use_container_width=True)
+
+            # ── Mode Courbe tendance ────────────────────────────────────────
+            elif g_mode == "📉 Courbe tendance":
+                grp = g_color if g_color in pace.columns and g_color != "Retard" else "Levier"
+                fig4 = px.scatter(
+                    pace, x="Pct_Temps_num", y="Pct_Budget",
+                    color=grp,
+                    trendline="ols",
+                    hover_name="Campagne", hover_data=hov_cols,
+                    labels={"Pct_Temps_num": "% Temps ecoule", "Pct_Budget": "% Budget utilise"},
+                    color_discrete_sequence=px.colors.qualitative.Bold,
+                )
+                fig4.add_shape(type="line", x0=0, y0=0, x1=150, y1=150,
+                               line=dict(color="gray", dash="dash", width=1))
+                fig4.update_layout(height=460, margin=dict(t=20))
+                st.plotly_chart(fig4, use_container_width=True)
+                st.caption("Courbes de tendance par groupe · Diagonale = rythme idéal")
+
+            # ── Mode Tableau ────────────────────────────────────────────────
+            else:
+                tbl_cols = [c for c in ["Campagne", "Levier", "Statut", "Affiliate",
+                                        "Pct_Temps_num", "Pct_Budget", "Retard",
+                                        "Budget_restant", "Marge_pct"] if c in pace.columns]
+                tbl = pace[tbl_cols].copy().sort_values("Retard", ascending=False)
+                tbl = tbl.rename(columns={"Pct_Temps_num": "% Temps", "Retard": "Retard (pts)"})
+                for c in ["Pct_Budget", "% Temps", "Retard (pts)", "Marge_pct"]:
+                    if c in tbl.columns:
+                        tbl[c] = tbl[c].apply(fmt_pct)
+                if "Budget_restant" in tbl.columns:
+                    tbl["Budget_restant"] = tbl["Budget_restant"].apply(fmt_eur)
+                st.dataframe(tbl, use_container_width=True, hide_index=True, height=420)
 
 
 # ─────────────────────────────────────────────
@@ -1488,3 +1693,156 @@ with tab_edit:
             st.session_state["edit_df"] = st.session_state["df_original"].copy()
             st.success("Données réinitialisées ✅")
             st.rerun()
+
+
+# ─────────────────────────────────────────────
+# TAB 6 — INTÉGRATIONS
+# ─────────────────────────────────────────────
+
+with tab_integrations:
+    st.header("🔌 Intégrations externes")
+    st.caption("Connecte tes outils de tracking pour enrichir l'analyse avec des données en temps réel.")
+
+    int_meta, int_leadflow = st.tabs(["📘 Meta Ads Manager", "📡 Leadflow / Cardata"])
+
+    # ── META ADS MANAGER ──────────────────────────────────────────────────
+    with int_meta:
+        st.subheader("📘 Meta Ads Manager")
+
+        with st.expander("⚙️ Configuration Meta", expanded="meta_df" not in st.session_state):
+            st.markdown("""
+**Comment obtenir ton token d'accès Meta :**
+1. Va sur [developers.facebook.com/tools/explorer](https://developers.facebook.com/tools/explorer)
+2. Sélectionne ton app → clique **Generate Access Token**
+3. Ajoute les permissions : `ads_read`, `ads_management`
+4. Copie le token et l'ID de ton compte publicitaire (format `act_XXXXXXXXX`)
+""")
+            meta_token   = st.text_input("Access Token Meta", type="password",
+                                         key="meta_token", placeholder="EAAxxxxxxx...")
+            meta_account = st.text_input("Ad Account ID", key="meta_account",
+                                         placeholder="123456789  (sans 'act_')")
+
+            if st.button("🔗 Connecter Meta", type="primary", key="btn_meta"):
+                if not meta_token or not meta_account:
+                    st.error("Renseigne le token et l'account ID.")
+                else:
+                    with st.spinner("Récupération des campagnes Meta…"):
+                        meta_df, err = fetch_meta_campaigns(meta_token, meta_account)
+                    if err:
+                        st.error(f"Erreur Meta API : {err}")
+                    elif meta_df is not None and not meta_df.empty:
+                        st.session_state["meta_df"] = meta_df
+                        st.success(f"✅ {len(meta_df)} campagnes récupérées depuis Meta !")
+                        st.rerun()
+                    else:
+                        st.warning("Aucune campagne trouvée pour ce compte.")
+
+        if "meta_df" in st.session_state:
+            meta_df = st.session_state["meta_df"]
+            st.success(f"✅ Connecté — {len(meta_df)} campagnes Meta chargées")
+
+            # KPIs Meta
+            mk1, mk2, mk3, mk4, mk5 = st.columns(5)
+            mk1.metric("Campagnes", len(meta_df))
+            mk2.metric("Dépenses totales", fmt_eur(meta_df["Dépenses (€)"].sum()))
+            mk3.metric("Clics totaux", f"{int(meta_df['Clics'].sum()):,}".replace(",", " "))
+            mk4.metric("Leads totaux", f"{int(meta_df['Leads'].sum()):,}".replace(",", " "))
+            mk5.metric("CPL moyen", fmt_eur(meta_df["CPL (€)"].dropna().mean()))
+
+            st.divider()
+
+            # Graphique dépenses par campagne
+            top_spend = meta_df.sort_values("Dépenses (€)", ascending=False).head(20)
+            if not top_spend.empty:
+                fig_m = px.bar(
+                    top_spend, x="Campagne", y="Dépenses (€)",
+                    color="Statut Meta",
+                    title="Dépenses par campagne Meta (Top 20)",
+                    color_discrete_sequence=px.colors.qualitative.Bold,
+                )
+                fig_m.update_layout(height=380, xaxis_tickangle=-40)
+                st.plotly_chart(fig_m, use_container_width=True)
+
+            # Tableau complet
+            with st.expander("📋 Toutes les données Meta"):
+                st.dataframe(meta_df, use_container_width=True, hide_index=True)
+
+            # Croisement avec les campagnes du fichier CSV
+            st.divider()
+            st.subheader("🔗 Croisement Meta × Fichier CSV")
+            merged = df.merge(
+                meta_df[["Campagne", "Dépenses (€)", "Clics", "Leads", "CPL (€)", "CTR (%)"]],
+                on="Campagne", how="left", suffixes=("", "_Meta")
+            )
+            matched = merged[merged["Dépenses (€)"].notna()]
+            if matched.empty:
+                st.info("Aucune campagne du fichier CSV ne correspond aux noms Meta. "
+                        "Vérifie que les noms de campagnes sont identiques dans les deux sources.")
+            else:
+                st.caption(f"{len(matched)} campagnes croisées")
+                cross_cols = [c for c in ["Campagne", "Levier", "Budget", "Dépenses (€)",
+                                          "Leads", "CPL (€)", "Marge_pct"] if c in matched.columns]
+                st.dataframe(matched[cross_cols], use_container_width=True, hide_index=True)
+
+            if st.button("🗑️ Déconnecter Meta", key="btn_disc_meta"):
+                del st.session_state["meta_df"]
+                st.rerun()
+
+    # ── LEADFLOW / CARDATA ────────────────────────────────────────────────
+    with int_leadflow:
+        st.subheader("📡 Leadflow / Cardata")
+
+        with st.expander("⚙️ Configuration Leadflow", expanded="lf_df" not in st.session_state):
+            st.markdown("""
+**Comment obtenir ta clé API Leadflow / Cardata :**
+1. Connecte-toi à ton espace Leadflow / Cardata
+2. Va dans **Paramètres → API / Intégrations**
+3. Génère ou copie ta clé API
+4. Renseigne l'URL de base de ton instance (ex: `https://app.cardata.io`)
+""")
+            lf_key  = st.text_input("Clé API Leadflow", type="password",
+                                     key="lf_key", placeholder="sk-lf-xxxxxxxxxx")
+            lf_url  = st.text_input("URL de base", key="lf_url",
+                                     placeholder="https://app.cardata.io  ou  https://app.leadflow.io",
+                                     value=st.session_state.get("lf_url_saved", ""))
+
+            if st.button("🔗 Connecter Leadflow", type="primary", key="btn_lf"):
+                if not lf_key or not lf_url:
+                    st.error("Renseigne la clé API et l'URL.")
+                else:
+                    with st.spinner("Connexion à Leadflow…"):
+                        lf_df, err = fetch_leadflow_campaigns(lf_key, lf_url)
+                    if err:
+                        st.error(f"Erreur Leadflow : {err}")
+                        st.info("💡 Si l'URL ou le format de l'API est différent, "
+                                "contacte-moi pour l'adapter à ta configuration exacte.")
+                    elif lf_df is not None and not lf_df.empty:
+                        st.session_state["lf_df"] = lf_df
+                        st.session_state["lf_url_saved"] = lf_url
+                        st.success(f"✅ {len(lf_df)} entrées récupérées depuis Leadflow !")
+                        st.rerun()
+                    else:
+                        st.warning("Connexion réussie mais aucune donnée retournée.")
+
+        if "lf_df" in st.session_state:
+            lf_df = st.session_state["lf_df"]
+            st.success(f"✅ Connecté — {len(lf_df)} entrées Leadflow chargées")
+
+            st.subheader("Données Leadflow brutes")
+            st.dataframe(lf_df, use_container_width=True, hide_index=True, height=400)
+
+            # Croisement avec CSV si colonne "name" ou "campaign_name" détectée
+            name_col = next((c for c in lf_df.columns
+                             if any(k in c.lower() for k in ["name", "campagne", "campaign"])), None)
+            if name_col:
+                st.divider()
+                st.subheader("🔗 Croisement Leadflow × Fichier CSV")
+                lf_merge = lf_df.rename(columns={name_col: "Campagne"})
+                merged_lf = df.merge(lf_merge, on="Campagne", how="left", suffixes=("", "_LF"))
+                matched_lf = merged_lf[merged_lf.columns[len(df.columns):][0]].notna()
+                st.caption(f"{matched_lf.sum()} campagnes croisées")
+                st.dataframe(merged_lf[matched_lf], use_container_width=True, hide_index=True)
+
+            if st.button("🗑️ Déconnecter Leadflow", key="btn_disc_lf"):
+                del st.session_state["lf_df"]
+                st.rerun()
