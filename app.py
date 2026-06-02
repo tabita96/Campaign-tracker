@@ -881,7 +881,7 @@ with tab_campaigns:
     # ── Filtres ligne 1 : statut campagne + objectif ──────────────────────
     ff1, ff2 = st.columns([2, 3])
     with ff1:
-        f_statut = st.multiselect("Statut campagne", sorted(df["Statut"].unique()), default=[])
+        f_statut = st.multiselect("Statut campagne", sorted(df["Statut"].dropna().unique()), default=[])
     with ff2:
         obj_options = {v[0]: k for k, v in OBJ_LABELS.items() if k != "inconnu"}
         f_obj = st.multiselect(
@@ -965,7 +965,7 @@ with tab_campaigns:
     # Campaign detail
     st.divider()
     st.subheader("Détail d'une campagne")
-    camp_names = sorted(filtered["Campagne"].unique())
+    camp_names = sorted(filtered["Campagne"].dropna().unique())
     selected = st.selectbox("Sélectionner une campagne", camp_names)
 
     if selected:
@@ -1196,11 +1196,11 @@ with tab_publisher:
         with pm1:
             sel_model = st.selectbox(
                 "Filtrer par Modèle",
-                ["Tous"] + sorted(pub_df["Modèle"].unique()),
+                ["Tous"] + sorted(pub_df["Modèle"].dropna().unique()),
             )
         with pm2:
             sel_statut_pub = st.multiselect(
-                "Statut", sorted(pub_df["Statut"].unique()), default=["active"]
+                "Statut", sorted(pub_df["Statut"].dropna().unique()), default=[]
             )
 
         view = pub_df.copy()
