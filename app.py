@@ -791,23 +791,24 @@ with tab_overview:
         st.metric("Marge totale (€)", fmt_eur(total_marge))
 
     with c2:
-        # Budget utilisation by levier
         if "Levier" in df.columns and "Budget" in df.columns:
             levier_budget = (
-                df.groupby("Levier")["Budget"]
+                df.dropna(subset=["Levier", "Budget"])
+                .groupby("Levier")["Budget"]
                 .sum()
                 .reset_index()
                 .sort_values("Budget", ascending=False)
             )
-            fig = px.bar(
-                levier_budget, x="Levier", y="Budget",
-                title="Budget par Levier",
-                color="Budget",
-                color_continuous_scale="Blues",
-                labels={"Budget": "Budget (€)"},
-            )
-            fig.update_layout(height=280, margin=dict(t=40, b=0))
-            st.plotly_chart(fig, use_container_width=True)
+            if not levier_budget.empty:
+                fig = px.bar(
+                    levier_budget, x="Levier", y="Budget",
+                    title="Budget par Levier",
+                    color="Budget",
+                    color_continuous_scale="Blues",
+                    labels={"Budget": "Budget (€)"},
+                )
+                fig.update_layout(height=280, margin=dict(t=40, b=0))
+                st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
     c3, c4 = st.columns(2)
@@ -825,24 +826,25 @@ with tab_overview:
         st.plotly_chart(fig2, use_container_width=True)
 
     with c4:
-        # Marge by Verticale
         if "Verticale" in df.columns and "Marge_€" in df.columns:
             vert = (
-                df[df["Verticale"].str.strip() != ""]
+                df.dropna(subset=["Marge_€"])
+                [df["Verticale"].astype(str).str.strip().replace("nan","") != ""]
                 .groupby("Verticale")["Marge_€"]
                 .sum()
                 .reset_index()
                 .sort_values("Marge_€", ascending=False)
                 .head(10)
             )
-            fig3 = px.bar(
-                vert, x="Marge_€", y="Verticale", orientation="h",
-                title="Marge par Verticale (Top 10)",
-                color="Marge_€",
-                color_continuous_scale="RdYlGn",
-            )
-            fig3.update_layout(height=300, margin=dict(t=40, b=0))
-            st.plotly_chart(fig3, use_container_width=True)
+            if not vert.empty:
+                fig3 = px.bar(
+                    vert, x="Marge_€", y="Verticale", orientation="h",
+                    title="Marge par Verticale (Top 10)",
+                    color="Marge_€",
+                    color_continuous_scale="RdYlGn",
+                )
+                fig3.update_layout(height=300, margin=dict(t=40, b=0))
+                st.plotly_chart(fig3, use_container_width=True)
 
     # Budget pace scatter
     if "Pct_Budget" in df.columns and "Pct_Temps" in df.columns:
@@ -854,14 +856,16 @@ with tab_overview:
             pace = pace[pace["Pct_Temps_num"].notna()]
             pace["Retard"] = pace["Pct_Budget"] - pace["Pct_Temps_num"]
 
+            hov_pace = [c for c in ["Campagne", "Levier", "Budget_restant"]
+                        if c in pace.columns]
             fig4 = px.scatter(
                 pace,
                 x="Pct_Temps_num", y="Pct_Budget",
                 text="Campagne",
                 color="Retard",
                 color_continuous_scale="RdYlGn",
-                labels={"Pct_Temps_num": "% Temps passé", "Pct_Budget": "% Budget utilisé"},
-                hover_data=["Campagne", "Levier", "Budget_restant"],
+                labels={"Pct_Temps_num": "% Temps passe", "Pct_Budget": "% Budget utilise"},
+                hover_data=hov_pace,
             )
             fig4.add_shape(type="line", x0=0, y0=0, x1=150, y1=150,
                            line=dict(color="gray", dash="dash"))
@@ -1212,54 +1216,84 @@ with tab_publisher:
         if view.empty:
             st.info("Aucune campagne pour ces filtres.")
         else:
-            # Scatter: Rém_NET vs Rém_Éditeur (margin visualisation)
-            fig_pub = px.scatter(
-                view,
-                x="Rém_Éditeur", y="Rém_NET",
-                color="Modèle",
-                size="Budget",
-                hover_name="Campagne",
-                hover_data=["Levier", "Marge_pct", "Volume_restant", "Statut"],
-                title="Rémunération NET vs Coût Éditeur",
-                labels={"Rém_Éditeur": "Coût Éditeur (€)", "Rém_NET": "Rém. NET (€)"},
-            )
-            # Diagonal = break-even
-            max_val = max(view["Rém_Éditeur"].max(), view["Rém_NET"].max())
-            fig_pub.add_shape(type="line", x0=0, y0=0, x1=max_val, y1=max_val,
-                              line=dict(color="red", dash="dash"))
-            fig_pub.update_layout(height=420)
-            st.plotly_chart(fig_pub, use_container_width=True)
-            st.caption("Points au-dessus de la diagonale rouge = marge positive. En dessous = perte.")
+            # ── Scatter Rém_NET vs Rém_Éditeur ───────────────────────────────
+            scatter_data = view.dropna(subset=["Rém_Éditeur", "Rém_NET"]).copy()
+            if scatter_data.empty:
+                st.info("Pas assez de données de rémunération pour afficher le graphique.")
+            else:
+                # size : Budget nettoyé — doit être strictement positif et sans NaN
+                med_budget = scatter_data["Budget"].median()
+                med_budget = med_budget if pd.notna(med_budget) and med_budget > 0 else 1000
+                scatter_data["_size"] = (
+                    scatter_data["Budget"]
+                    .fillna(med_budget)
+                    .clip(lower=1)
+                )
+                # hover_data : uniquement les colonnes qui existent
+                hov = [c for c in ["Levier", "Marge_pct", "Volume_restant", "Statut"]
+                       if c in scatter_data.columns]
+
+                fig_pub = px.scatter(
+                    scatter_data,
+                    x="Rém_Éditeur", y="Rém_NET",
+                    color="Modèle" if "Modèle" in scatter_data.columns else None,
+                    size="_size",
+                    size_max=40,
+                    hover_name="Campagne",
+                    hover_data=hov,
+                    title="Rémunération NET vs Coût Éditeur",
+                    labels={"Rém_Éditeur": "Cout Editeur", "Rém_NET": "Rem. NET",
+                            "_size": "Budget"},
+                )
+                x_max = float(scatter_data["Rém_Éditeur"].max())
+                y_max = float(scatter_data["Rém_NET"].max())
+                diag = max(x_max, y_max) * 1.1
+                if diag > 0:
+                    fig_pub.add_shape(
+                        type="line", x0=0, y0=0, x1=diag, y1=diag,
+                        line=dict(color="red", dash="dash"),
+                    )
+                fig_pub.update_layout(height=420)
+                st.plotly_chart(fig_pub, use_container_width=True)
+                st.caption("Points au-dessus de la diagonale rouge = marge positive. En dessous = perte.")
 
             st.divider()
-            # Ranking table
+            # ── Ranking table ─────────────────────────────────────────────────
             st.subheader("Classement par attractivité éditeur (coût le plus bas)")
-            rank = view[["Campagne", "Modèle", "Levier", "Rém_Éditeur", "Rém_NET",
-                         "Marge_pct", "Volume_restant", "Statut"]].copy()
-            rank = rank.sort_values("Rém_Éditeur")
-            rank["Marge_pct"] = rank["Marge_pct"].apply(fmt_pct)
-            rank["Rém_Éditeur"] = rank["Rém_Éditeur"].apply(fmt_eur)
-            rank["Rém_NET"] = rank["Rém_NET"].apply(fmt_eur)
-            rank["Volume_restant"] = rank["Volume_restant"].apply(
-                lambda x: f"{int(x):,}".replace(",", " ") if not pd.isna(x) else "—"
-            )
+            rank_cols = [c for c in ["Campagne", "Modèle", "Levier", "Rém_Éditeur",
+                                     "Rém_NET", "Marge_pct", "Volume_restant", "Statut"]
+                         if c in view.columns]
+            rank = view[rank_cols].copy()
+            if "Rém_Éditeur" in rank.columns:
+                rank = rank.sort_values("Rém_Éditeur", na_position="last")
+            if "Marge_pct"    in rank.columns: rank["Marge_pct"]    = rank["Marge_pct"].apply(fmt_pct)
+            if "Rém_Éditeur"  in rank.columns: rank["Rém_Éditeur"]  = rank["Rém_Éditeur"].apply(fmt_eur)
+            if "Rém_NET"      in rank.columns: rank["Rém_NET"]      = rank["Rém_NET"].apply(fmt_eur)
+            if "Volume_restant" in rank.columns:
+                rank["Volume_restant"] = rank["Volume_restant"].apply(
+                    lambda x: f"{int(x):,}".replace(",", " ") if pd.notna(x) else "—"
+                )
             st.dataframe(rank, use_container_width=True, hide_index=True)
 
             st.divider()
-            # Best opportunities: active with remaining volume & best margin
+            # ── Top opportunités ──────────────────────────────────────────────
             st.subheader("Top opportunités — Volume restant + Marge élevée")
             opps = pub_df[
-                (pub_df["Statut"].isin(["active", "set-up"])) &
+                pub_df["Statut"].isin(["active", "set-up"]) &
                 pub_df["Volume_restant"].notna() &
                 (pub_df["Volume_restant"] > 0) &
                 pub_df["Marge_pct"].notna()
             ].copy()
             opps = opps.sort_values("Marge_pct", ascending=False).head(15)
-            if not opps.empty:
+            if opps.empty:
+                st.info("Aucune campagne active avec volume restant et marge connue.")
+            else:
+                hov2 = [c for c in ["Volume_restant", "Rém_Éditeur", "Rém_NET"]
+                        if c in opps.columns]
                 fig_opp = px.bar(
                     opps, x="Campagne", y="Marge_pct",
-                    color="Modèle",
-                    hover_data=["Volume_restant", "Rém_Éditeur", "Rém_NET"],
+                    color="Modèle" if "Modèle" in opps.columns else None,
+                    hover_data=hov2,
                     title="Marge % — Campagnes avec volume restant (Top 15)",
                     labels={"Marge_pct": "Marge (%)"},
                 )
