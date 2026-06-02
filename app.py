@@ -273,6 +273,77 @@ def load_data(raw_bytes: bytes, filename: str) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────
+# OBJECTIF STATUS ENGINE
+# ─────────────────────────────────────────────
+
+_STATUTS_TERMINES = {"budget fait", "finie", "budget non-atteint",
+                     "budget non atteint", "pause", "en pause"}
+
+OBJ_LABELS = {
+    "atteint":          ("🎯 Atteint",              "#dcfce7", "#166534"),
+    "presque_atteint":  ("🟡 Presque atteint",      "#fef9c3", "#713f12"),
+    "difficile":        ("⚠️ Difficile à atteindre", "#fff7ed", "#9a3412"),
+    "non_atteint":      ("❌ Non atteint",            "#fee2e2", "#7f1d1d"),
+    "en_cours":         ("🔵 En cours",              "#eff6ff", "#1e40af"),
+    "inconnu":          ("⬜ Inconnu",               "#f3f4f6", "#374151"),
+}
+
+
+def _obj_status(row) -> str:
+    """Calcule le statut d'atteinte d'objectif pour une ligne de campagne."""
+    realise  = row.get("Volume_réalisé", np.nan)
+    objectif = row.get("Objectif",       np.nan)
+    pct_temps = row.get("Pct_Temps",     np.nan)
+    statut   = str(row.get("Statut", "")).lower().strip()
+
+    # Données insuffisantes
+    if pd.isna(realise) or pd.isna(objectif) or objectif == 0:
+        return "inconnu"
+
+    pct_obj = (realise / objectif) * 100          # % de l'objectif réalisé
+    terminee = statut in _STATUTS_TERMINES
+
+    # ── Objectif atteint ──────────────────────────────────────────────────
+    if pct_obj >= 95:
+        return "atteint"
+
+    # ── Objectif presque atteint ──────────────────────────────────────────
+    if pct_obj >= 75:
+        return "presque_atteint"
+
+    # ── Campagne terminée avec objectif non atteint ───────────────────────
+    if terminee:
+        return "non_atteint"
+
+    # ── Analyse de tendance pour les campagnes en cours ───────────────────
+    pct_t = None
+    if not pd.isna(pct_temps):
+        try:
+            pct_t = float(str(pct_temps).replace("%", "").strip())
+        except Exception:
+            pct_t = None
+
+    if pct_t is not None and pct_t > 0:
+        # Projection : à ce rythme, quel % de l'objectif sera atteint à 100% du temps ?
+        projected_pct = (realise / (pct_t / 100)) / objectif * 100
+        # Déjà > 65 % du temps écoulé mais projection < 80 % de l'objectif → difficile
+        if pct_t >= 65 and projected_pct < 80:
+            return "difficile"
+        # Moins de 65 % du temps mais déjà en retard très marqué
+        if pct_t >= 40 and projected_pct < 50:
+            return "difficile"
+
+    return "en_cours"
+
+
+def enrich_obj_status(df: pd.DataFrame) -> pd.DataFrame:
+    """Ajoute la colonne Obj_Status au dataframe."""
+    df = df.copy()
+    df["Obj_Status"] = df.apply(_obj_status, axis=1)
+    return df
+
+
+# ─────────────────────────────────────────────
 # ALERT ENGINE
 # ─────────────────────────────────────────────
 
@@ -609,6 +680,9 @@ if df.empty:
     st.warning("Aucune donnée chargée. Importez un fichier CSV ou Excel via la barre latérale.")
     st.stop()
 
+# Enrichir avec le statut objectif
+df = enrich_obj_status(df)
+
 # Compute alerts
 alerts = compute_alerts(df, budget_warn, budget_danger, publisher_gap)
 
@@ -662,6 +736,58 @@ with tab_overview:
     col5.metric("🔔 Alertes", total_alerts,
                 delta=f"{len(alerts['danger'])} danger" if alerts["danger"] else None,
                 delta_color="inverse")
+
+    # ── KPIs Objectifs ──────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("🎯 Atteinte des objectifs")
+
+    ok1, ok2, ok3, ok4, ok5 = st.columns(5)
+    counts = df["Obj_Status"].value_counts()
+    ok1.metric("🎯 Atteint",               counts.get("atteint",         0))
+    ok2.metric("🟡 Presque atteint",        counts.get("presque_atteint", 0))
+    ok3.metric("⚠️ Difficile à atteindre",  counts.get("difficile",       0))
+    ok4.metric("❌ Non atteint",             counts.get("non_atteint",     0))
+    ok5.metric("🔵 En cours",               counts.get("en_cours",        0))
+
+    # Graphique donut répartition objectifs
+    obj_counts = (
+        df["Obj_Status"]
+        .map(lambda x: OBJ_LABELS.get(x, ("Autre", "#ccc", "#000"))[0])
+        .value_counts()
+        .reset_index()
+    )
+    obj_counts.columns = ["Statut objectif", "Nombre"]
+    color_map = {v[0]: v[1] for v in OBJ_LABELS.values()}
+    fig_obj = px.pie(
+        obj_counts, names="Statut objectif", values="Nombre",
+        title="Répartition statut objectif",
+        color="Statut objectif",
+        color_discrete_map=color_map,
+        hole=0.45,
+    )
+    fig_obj.update_layout(height=260, margin=dict(t=40, b=0))
+
+    # Tableau de détail : campagnes difficiles / non atteintes
+    at_risk = df[df["Obj_Status"].isin(["difficile", "non_atteint"])][
+        ["Campagne", "Levier", "Statut", "Obj_Status", "Volume_réalisé", "Objectif", "Pct_Temps"]
+    ].copy()
+    at_risk["% Objectif"] = (at_risk["Volume_réalisé"] / at_risk["Objectif"] * 100).apply(
+        lambda x: fmt_pct(x) if not pd.isna(x) else "—"
+    )
+    at_risk["Obj_Status"] = at_risk["Obj_Status"].map(
+        lambda x: OBJ_LABELS.get(x, ("?","",""))[0]
+    )
+
+    ov_c1, ov_c2 = st.columns([1, 2])
+    with ov_c1:
+        st.plotly_chart(fig_obj, use_container_width=True)
+    with ov_c2:
+        if not at_risk.empty:
+            st.caption("Campagnes difficiles / non atteintes")
+            st.dataframe(at_risk.drop(columns=["Volume_réalisé", "Objectif"]),
+                         use_container_width=True, hide_index=True, height=220)
+        else:
+            st.success("✅ Aucune campagne en difficulté sur les objectifs.")
 
     st.divider()
 
@@ -768,10 +894,21 @@ with tab_overview:
 with tab_campaigns:
     st.header("Analyse des campagnes")
 
-    # Filters
-    fc1, fc2, fc3, fc4, fc5 = st.columns(5)
-    with fc1:
-        f_statut = st.multiselect("Statut", sorted(df["Statut"].unique()), default=[])
+    # ── Filtres ligne 1 : statut campagne + objectif ──────────────────────
+    ff1, ff2 = st.columns([2, 3])
+    with ff1:
+        f_statut = st.multiselect("Statut campagne", sorted(df["Statut"].unique()), default=[])
+    with ff2:
+        obj_options = {v[0]: k for k, v in OBJ_LABELS.items() if k != "inconnu"}
+        f_obj = st.multiselect(
+            "🎯 Statut objectif",
+            options=list(obj_options.keys()),
+            default=[],
+            help="Filtrer par niveau d'atteinte de l'objectif volume",
+        )
+
+    # ── Filtres ligne 2 : dimensions ──────────────────────────────────────
+    fc2, fc3, fc4, fc5, fc6 = st.columns(5)
     with fc2:
         leviers = sorted(df["Levier"].dropna().unique()) if "Levier" in df.columns else []
         f_levier = st.multiselect("Levier", leviers, default=[])
@@ -784,10 +921,16 @@ with tab_campaigns:
     with fc5:
         accounts = sorted(df["Account"].dropna().replace("", np.nan).dropna().unique()) if "Account" in df.columns else []
         f_account = st.multiselect("Account", accounts, default=[])
+    with fc6:
+        verticals = sorted(df["Verticale"].dropna().replace("", np.nan).dropna().unique()) if "Verticale" in df.columns else []
+        f_vertical = st.multiselect("Verticale", verticals, default=[])
 
     filtered = df.copy()
     if f_statut:
         filtered = filtered[filtered["Statut"].isin(f_statut)]
+    if f_obj:
+        codes = [obj_options[label] for label in f_obj]
+        filtered = filtered[filtered["Obj_Status"].isin(codes)]
     if f_levier:
         filtered = filtered[filtered["Levier"].isin(f_levier)]
     if f_geo:
@@ -796,6 +939,8 @@ with tab_campaigns:
         filtered = filtered[filtered["Modèle"].isin(f_model)]
     if f_account:
         filtered = filtered[filtered["Account"].isin(f_account)]
+    if f_vertical:
+        filtered = filtered[filtered["Verticale"].isin(f_vertical)]
 
     search = st.text_input("🔍 Recherche campagne", placeholder="Nom, annonceur…")
     if search:
@@ -807,11 +952,16 @@ with tab_campaigns:
     st.caption(f"{len(filtered)} campagne(s) affichée(s)")
 
     # Display table
-    display_cols = ["Campagne", "Géo", "Levier", "Modèle", "Statut",
+    display_cols = ["Campagne", "Géo", "Levier", "Modèle", "Statut", "Obj_Status",
                     "Budget", "Budget_restant", "Pct_Budget", "Pct_Temps",
                     "Volume_réalisé", "Volume_restant", "Marge_pct", "Marge_€",
                     "Rém_Ann", "Rém_NET", "Rém_Éditeur", "Affiliate", "Account"]
     disp = filtered[[c for c in display_cols if c in filtered.columns]].copy()
+    # Remplacer les codes internes par les labels lisibles
+    if "Obj_Status" in disp.columns:
+        disp["Obj_Status"] = disp["Obj_Status"].map(
+            lambda x: OBJ_LABELS.get(x, ("—", "", ""))[0]
+        )
 
     # Format for display
     for col in ["Budget", "Budget_restant", "Marge_€", "Rém_Ann", "Rém_NET", "Rém_Éditeur"]:
