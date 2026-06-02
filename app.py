@@ -664,6 +664,17 @@ if df.empty:
     st.warning("Aucune donnée chargée. Importez un fichier CSV ou Excel via la barre latérale.")
     st.stop()
 
+# ── Session state : conserver les modifications entre les rechargements ──────
+_file_id = (fname if uploaded else "sample") + str(len(raw))
+if st.session_state.get("_file_id") != _file_id:
+    # Nouveau fichier → on repart des données fraîches
+    st.session_state["_file_id"]    = _file_id
+    st.session_state["edit_df"]     = df.copy()
+    st.session_state["df_original"] = df.copy()
+
+# Le dataframe de travail (potentiellement modifié par l'utilisateur)
+df = st.session_state["edit_df"].copy()
+
 # Enrichir avec le statut objectif
 df = enrich_obj_status(df)
 
@@ -696,8 +707,8 @@ if st.session_state.get("send_alerts"):
 total_alerts = len(alerts["danger"]) + len(alerts["warning"]) + len(alerts["publisher"])
 alert_label = f"🔔 Alertes ({total_alerts})" if total_alerts else "🔔 Alertes"
 
-tab_overview, tab_campaigns, tab_alerts, tab_publisher = st.tabs(
-    ["🏠 Vue d'ensemble", "📋 Campagnes", alert_label, "💡 Éditeurs"]
+tab_overview, tab_campaigns, tab_alerts, tab_publisher, tab_edit = st.tabs(
+    ["🏠 Vue d'ensemble", "📋 Campagnes", alert_label, "💡 Éditeurs", "✏️ Édition"]
 )
 
 
@@ -1299,3 +1310,181 @@ with tab_publisher:
                 )
                 fig_opp.update_layout(height=350, xaxis_tickangle=-45)
                 st.plotly_chart(fig_opp, use_container_width=True)
+
+
+# ─────────────────────────────────────────────
+# TAB 5 — ÉDITION DES DONNÉES
+# ─────────────────────────────────────────────
+
+_CORE_COLS = {"Campagne", "Statut", "Budget", "Levier", "Modèle",
+              "Rém_Ann", "Rém_NET", "Rém_Éditeur", "Budget_restant",
+              "Pct_Budget", "Pct_Temps", "Volume_réalisé", "Objectif"}
+
+with tab_edit:
+    st.header("✏️ Édition des données")
+    st.caption("Modifie, ajoute ou supprime des lignes et des colonnes. Clique sur **Appliquer** pour mettre à jour toutes les analyses.")
+
+    edit_df = st.session_state["edit_df"].copy()
+    # Retire la colonne calculée Obj_Status de l'éditeur
+    edit_display = edit_df.drop(columns=["Obj_Status"], errors="ignore")
+
+    # ── Gestion des colonnes ───────────────────────────────────────────────
+    st.subheader("🗂️ Gestion des colonnes")
+    gc1, gc2 = st.columns([3, 2])
+
+    with gc1:
+        all_cols = list(edit_display.columns)
+        default_visible = [c for c in all_cols
+                           if c not in {"Objectif_date", "Objectif_date2", "Campagne_map"}]
+        visible_cols = st.multiselect(
+            "Colonnes affichées dans l'éditeur",
+            options=all_cols,
+            default=[c for c in default_visible if c in all_cols],
+            key="visible_cols",
+        )
+
+    with gc2:
+        with st.expander("➕ Ajouter une colonne"):
+            new_name = st.text_input("Nom", placeholder="Ex: Commentaire", key="nc_name")
+            new_type = st.selectbox("Type", ["Texte", "Nombre (€)", "Pourcentage (%)", "Oui/Non"], key="nc_type")
+            new_default = st.text_input("Valeur par défaut (optionnel)", key="nc_default")
+            if st.button("Ajouter la colonne", key="btn_add_col", use_container_width=True):
+                if not new_name:
+                    st.error("Saisis un nom.")
+                elif new_name in edit_df.columns:
+                    st.error("Cette colonne existe déjà.")
+                else:
+                    if new_type == "Nombre (€)":
+                        try:    dv = float(new_default) if new_default else np.nan
+                        except: dv = np.nan
+                    elif new_type == "Pourcentage (%)":
+                        try:    dv = float(new_default) if new_default else np.nan
+                        except: dv = np.nan
+                    elif new_type == "Oui/Non":
+                        dv = new_default.lower() in ["oui","yes","true","1"] if new_default else False
+                    else:
+                        dv = new_default or ""
+                    edit_df[new_name] = dv
+                    st.session_state["edit_df"] = edit_df
+                    st.success(f"Colonne **{new_name}** ajoutée ✅")
+                    st.rerun()
+
+        with st.expander("🗑️ Supprimer une colonne"):
+            deletable = [c for c in edit_display.columns if c not in _CORE_COLS]
+            to_delete = st.multiselect("Colonnes à supprimer", deletable, key="cols_del",
+                                       help="Les colonnes essentielles à l'analyse ne peuvent pas être supprimées.")
+            if to_delete and st.button("Supprimer", key="btn_del", type="secondary", use_container_width=True):
+                edit_df = edit_df.drop(columns=to_delete, errors="ignore")
+                st.session_state["edit_df"] = edit_df
+                st.success(f"{len(to_delete)} colonne(s) supprimée(s) ✅")
+                st.rerun()
+
+    st.divider()
+
+    # ── Éditeur de données ─────────────────────────────────────────────────
+    st.subheader("📝 Tableau de données")
+
+    show_cols = [c for c in (visible_cols or list(edit_display.columns)) if c in edit_display.columns]
+    editor_data = edit_display[show_cols].copy() if show_cols else edit_display.copy()
+
+    # Convertir les colonnes numériques pour l'éditeur
+    for col in ["Budget", "Rém_Ann", "Rém_NET", "Rém_Éditeur", "Budget_restant",
+                "CA_interne", "CA_externe", "Marge_€", "Marge_pct",
+                "Pct_Budget", "Pct_Temps", "Objectif", "Volume_réalisé", "Volume_restant"]:
+        if col in editor_data.columns:
+            editor_data[col] = pd.to_numeric(editor_data[col], errors="coerce")
+
+    col_config = {}
+    _euro_cols = {"Budget": "Budget (€)", "Rém_Ann": "Rém. Ann.", "Rém_NET": "Rém. NET",
+                  "Rém_Éditeur": "Rém. Éditeur", "Budget_restant": "Budget restant",
+                  "CA_interne": "CA interne", "CA_externe": "CA externe", "Marge_€": "Marge"}
+    for k, lbl in _euro_cols.items():
+        if k in editor_data.columns:
+            col_config[k] = st.column_config.NumberColumn(lbl, format="%.2f €", step=0.01)
+
+    _pct_cols = {"Marge_pct": "Marge %", "Pct_Budget": "% Budget", "Pct_Temps": "% Temps"}
+    for k, lbl in _pct_cols.items():
+        if k in editor_data.columns:
+            col_config[k] = st.column_config.NumberColumn(lbl, format="%.1f %%", step=0.1)
+
+    _int_cols = {"Objectif": "Objectif", "Volume_réalisé": "Vol. réalisé", "Volume_restant": "Vol. restant"}
+    for k, lbl in _int_cols.items():
+        if k in editor_data.columns:
+            col_config[k] = st.column_config.NumberColumn(lbl, format="%d", step=1)
+
+    if "Statut" in editor_data.columns:
+        col_config["Statut"] = st.column_config.SelectboxColumn(
+            "Statut", options=["active", "set-up", "budget fait", "en pause",
+                               "finie", "budget non-atteint", "pause"])
+    if "Levier" in editor_data.columns:
+        col_config["Levier"] = st.column_config.SelectboxColumn(
+            "Levier", options=["Social", "Emailing", "COREG", "Emulation",
+                               "Display", "Coreg", "Affiliation"])
+    if "Modèle" in editor_data.columns:
+        col_config["Modèle"] = st.column_config.SelectboxColumn(
+            "Modèle", options=["CPL", "CPC", "CPM", "CPA", "CPV"])
+    if "Début" in editor_data.columns:
+        col_config["Début"] = st.column_config.DateColumn("Début", format="DD/MM/YYYY")
+    if "Fin" in editor_data.columns:
+        col_config["Fin"] = st.column_config.DateColumn("Fin", format="DD/MM/YYYY")
+
+    edited = st.data_editor(
+        editor_data,
+        column_config=col_config,
+        num_rows="dynamic",
+        use_container_width=True,
+        height=520,
+        key="data_editor_main",
+    )
+
+    st.divider()
+
+    # ── Boutons d'action ───────────────────────────────────────────────────
+    ba1, ba2, ba3 = st.columns(3)
+
+    with ba1:
+        if st.button("✅ Appliquer les modifications", type="primary", use_container_width=True):
+            updated = edit_df.copy()
+            # Mettre à jour les colonnes éditées
+            for col in edited.columns:
+                if col in updated.columns:
+                    # Aligner par position (l'éditeur peut avoir des lignes ajoutées/supprimées)
+                    if len(edited) == len(updated):
+                        updated[col] = edited[col].values
+                    else:
+                        updated = updated.iloc[:len(edited)].reset_index(drop=True)
+                        updated[col] = edited[col].values
+            # Nouvelles lignes ajoutées dans l'éditeur
+            if len(edited) > len(updated):
+                extra = edited.iloc[len(updated):].copy()
+                updated = pd.concat([updated, extra], ignore_index=True)
+            # Normaliser Statut
+            if "Statut" in updated.columns:
+                updated["Statut"] = updated["Statut"].astype(str).str.lower().str.strip()
+            # Supprimer les lignes vides (Campagne vide)
+            if "Campagne" in updated.columns:
+                updated = updated[~updated["Campagne"].astype(str).str.strip()
+                                  .str.lower().isin(["", "nan"])]
+            st.session_state["edit_df"] = updated
+            st.success("✅ Modifications appliquées — toutes les analyses sont mises à jour !")
+            st.rerun()
+
+    with ba2:
+        csv_out = (
+            st.session_state["edit_df"]
+            .drop(columns=["Obj_Status"], errors="ignore")
+            .to_csv(index=False, sep=";", decimal=",")
+        )
+        st.download_button(
+            "⬇️ Télécharger CSV édité",
+            data=csv_out.encode("utf-8-sig"),
+            file_name=f"campagnes_editees_{date.today().isoformat()}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    with ba3:
+        if st.button("🔄 Réinitialiser (données originales)", type="secondary", use_container_width=True):
+            st.session_state["edit_df"] = st.session_state["df_original"].copy()
+            st.success("Données réinitialisées ✅")
+            st.rerun()
