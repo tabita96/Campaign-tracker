@@ -105,62 +105,203 @@ def parse_date(val):
     return pd.NaT
 
 
+# Keywords used to detect a group-header row (should be skipped)
+_GROUP_HEADER_KEYWORDS = {
+    "cr", "ation", "création", "creation", "quipe", "équipe", "equipe",
+    "informations", "delivery", "marge", "vue d", "mapping",
+}
+
+# Fuzzy mapping: fragments to look for (lowercase, no accents) → canonical name
+_COL_FUZZY = {
+    "campagne":        "Campagne",
+    "geo":             "Géo",
+    "entit":           "Entité",
+    "stats":           "Stats",
+    "levier":          "Levier",
+    "statut":          "Statut",
+    "affiliat":        "Affiliate",
+    "account":         "Account",
+    "budget":          "Budget",
+    "but":             "Budget",          # "Budget" with encoding glitch
+    "d but":           "Début",
+    "debut":           "Début",
+    "fin":             "Fin",
+    "mod le":          "Modèle",
+    "model":           "Modèle",
+    "r m. ann":        "Rém_Ann",
+    "rem. ann":        "Rém_Ann",
+    "r m. net":        "Rém_NET",
+    "rem. net":        "Rém_NET",
+    "r m. dit":        "Rém_Éditeur",
+    "rem. edit":       "Rém_Éditeur",
+    "marge":           "Marge_pct",
+    "objectif":        "Objectif",
+    "budget restant":  "Budget_restant",
+    "volume restant":  "Volume_restant",
+    "volume r":        "Volume_réalisé",
+    "ca interne":      "CA_interne",
+    "ca externe":      "CA_externe",
+    "% budget":        "Pct_Budget",
+    "% temps":         "Pct_Temps",
+    "annonceur":       "Annonceur",
+    "march":           "Marché",
+    "verticale":       "Verticale",
+    "marge €":         "Marge_€",
+    "marge e":         "Marge_€",
+}
+
+# Positional fallback (column index → canonical name) — matches the sample CSV layout
+_COL_POSITIONAL = [
+    "Campagne", "Géo", "Entité", "Stats", "Levier", "Statut",
+    "Affiliate", "Account", "Budget", "Début", "Fin", "Modèle",
+    "Rém_Ann", "Rém_NET", "Rém_Éditeur", "Marge_pct",
+    "Objectif", "Objectif_date", "Budget_restant",
+    "Objectif_date2", "Volume_restant", "Volume_réalisé",
+    "CA_interne", "CA_externe", "Pct_Budget", "Pct_Temps",
+    "Annonceur", "Marché", "Campagne_map", "Verticale", "Marge_€",
+]
+
+_STATUS_VALUES = {"active", "set-up", "setup", "budget fait", "en pause",
+                  "pause", "finie", "budget non-atteint", "budget non atteint"}
+
+
+def _strip_accents(s: str) -> str:
+    import unicodedata
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s)
+        if unicodedata.category(c) != "Mn"
+    )
+
+
+def _normalize_col(s: str) -> str:
+    """Lowercase, strip accents, collapse whitespace."""
+    return re.sub(r"\s+", " ", _strip_accents(str(s)).lower().strip())
+
+
+def _is_group_header_row(row: pd.Series) -> bool:
+    """True if the row looks like a merged-cell group header (should be skipped)."""
+    non_empty = [str(v).strip() for v in row if str(v).strip() not in ("", "nan")]
+    if len(non_empty) == 0:
+        return True
+    # Group header rows tend to have many empty cells and keyword-like values
+    empty_ratio = 1 - len(non_empty) / len(row)
+    first = _normalize_col(non_empty[0]) if non_empty else ""
+    has_keyword = any(k in first for k in _GROUP_HEADER_KEYWORDS)
+    return empty_ratio > 0.5 and has_keyword
+
+
+def _fuzzy_rename(df: pd.DataFrame) -> pd.DataFrame:
+    """Try to rename columns using fuzzy keyword matching, then positional fallback."""
+    rename_map = {}
+    already_used = set()
+
+    for col in df.columns:
+        norm = _normalize_col(col)
+        matched = None
+        # Try fuzzy match
+        for fragment, canonical in _COL_FUZZY.items():
+            if fragment in norm and canonical not in already_used:
+                matched = canonical
+                break
+        if matched:
+            rename_map[col] = matched
+            already_used.add(matched)
+
+    df = df.rename(columns=rename_map)
+
+    # Positional fallback for columns still not matched
+    positional_used = set(df.columns)
+    for i, canonical in enumerate(_COL_POSITIONAL):
+        if canonical in df.columns:
+            continue  # already renamed
+        # Find the i-th column that hasn't been renamed to a canonical name yet
+        unnamed_cols = [c for c in df.columns
+                        if c not in set(_COL_POSITIONAL) and c not in rename_map.values()]
+        if unnamed_cols:
+            df = df.rename(columns={unnamed_cols[0]: canonical})
+
+    return df
+
+
+def _auto_skiprows(raw_bytes: bytes, encoding: str, sep: str, is_excel: bool) -> int:
+    """Detect whether the file starts with a group-header row that should be skipped."""
+    try:
+        if is_excel:
+            peek = pd.read_excel(io.BytesIO(raw_bytes), nrows=3,
+                                 dtype=str, header=None)
+        else:
+            peek = pd.read_csv(io.BytesIO(raw_bytes), sep=sep, nrows=3,
+                               encoding=encoding, dtype=str,
+                               header=None, on_bad_lines="skip")
+        if len(peek) >= 2 and _is_group_header_row(peek.iloc[0]):
+            return 1   # skip the group-header row; row 1 has real column names
+        return 0       # row 0 already has real column names (or is data)
+    except Exception:
+        return 1       # safe default for the known sample format
+
+
 @st.cache_data(show_spinner="Chargement des données…")
 def load_data(raw_bytes: bytes, filename: str) -> pd.DataFrame:
-    try:
-        if filename.lower().endswith(".csv"):
-            df = None
-            for enc in ["cp1252", "iso-8859-1", "utf-8-sig", "utf-8"]:
-                try:
-                    df = pd.read_csv(
-                        io.BytesIO(raw_bytes),
-                        sep=";",
-                        skiprows=1,
-                        encoding=enc,
-                        on_bad_lines="skip",
-                        dtype=str,
-                    )
-                    break
-                except Exception:
-                    continue
-        else:
-            df = pd.read_excel(io.BytesIO(raw_bytes), skiprows=1, dtype=str)
-    except Exception as e:
-        st.error(f"Erreur de chargement : {e}")
-        return pd.DataFrame()
+    is_excel = filename.lower().endswith((".xlsx", ".xls"))
+    df = None
+    encoding_used = "cp1252"
+
+    for enc in ["cp1252", "iso-8859-1", "utf-8-sig", "utf-8"]:
+        try:
+            skip = _auto_skiprows(raw_bytes, enc, ";", is_excel)
+            if is_excel:
+                df = pd.read_excel(io.BytesIO(raw_bytes),
+                                   skiprows=skip, dtype=str)
+            else:
+                df = pd.read_csv(
+                    io.BytesIO(raw_bytes),
+                    sep=";",
+                    skiprows=skip,
+                    encoding=enc,
+                    on_bad_lines="skip",
+                    dtype=str,
+                )
+            encoding_used = enc
+            break
+        except Exception:
+            continue
 
     if df is None or df.empty:
+        st.error("Impossible de lire le fichier. Vérifie qu'il est au format CSV (séparateur `;`) ou Excel.")
         return pd.DataFrame()
 
-    # Rename columns by position (robust to encoding variants)
-    names = [
-        "Campagne", "Géo", "Entité", "Stats", "Levier", "Statut",
-        "Affiliate", "Account", "Budget", "Début", "Fin", "Modèle",
-        "Rém_Ann", "Rém_NET", "Rém_Éditeur", "Marge_pct",
-        "Objectif", "Objectif_date", "Budget_restant",
-        "Objectif_date2", "Volume_restant", "Volume_réalisé",
-        "CA_interne", "CA_externe", "Pct_Budget", "Pct_Temps",
-        "Annonceur", "Marché", "Campagne_map", "Verticale", "Marge_€",
-    ]
-    for i, name in enumerate(names):
-        if i < len(df.columns):
-            df.rename(columns={df.columns[i]: name}, inplace=True)
+    # Drop fully-empty columns (sometimes artifacts of the CSV format)
+    df = df.dropna(how="all", axis=1)
 
-    # Drop empty rows
-    df = df.dropna(subset=["Campagne"])
-    df = df[df["Campagne"].str.strip().str.lower() != "nan"]
-    df = df[df["Campagne"].str.strip() != ""]
+    # Drop leading unnamed/empty column that some exports add
+    if df.columns[0] in ("", "Unnamed: 0") or str(df.columns[0]).startswith("Unnamed"):
+        df = df.iloc[:, 1:]
 
-    # Strip text columns
+    # Rename columns: fuzzy + positional fallback
+    df = _fuzzy_rename(df)
+
+    # Drop fully-empty rows and rows where Campagne is blank/NaN
+    df = df.dropna(how="all")
+    if "Campagne" not in df.columns:
+        st.error("Colonne 'Campagne' introuvable. Vérifie la structure du fichier.")
+        return pd.DataFrame()
+
+    df = df[df["Campagne"].astype(str).str.strip().str.lower().isin(["", "nan"]) == False]
+
+    # Strip text columns — always guard with `in df.columns`
     text_cols = ["Campagne", "Géo", "Entité", "Stats", "Levier", "Statut",
                  "Affiliate", "Account", "Modèle", "Annonceur", "Marché",
                  "Campagne_map", "Verticale"]
     for col in text_cols:
         if col in df.columns:
-            df[col] = df[col].astype(str).str.strip()
-            df[col] = df[col].replace("nan", "")
+            df[col] = df[col].astype(str).str.strip().replace("nan", "")
 
-    df["Statut"] = df["Statut"].str.lower().str.strip()
+    # Normalise Statut
+    if "Statut" in df.columns:
+        df["Statut"] = df["Statut"].str.lower().str.strip()
+    else:
+        st.warning("Colonne 'Statut' non détectée — les filtres de statut ne fonctionneront pas.")
+        df["Statut"] = ""
 
     # Parse numeric/currency
     for col in ["Budget", "Rém_Ann", "Rém_NET", "Rém_Éditeur",
