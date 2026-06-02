@@ -160,25 +160,29 @@ def _detect_separator(raw_bytes: bytes, encoding: str) -> str:
         return ";"
 
 
-def _detect_skiprows(raw_bytes: bytes, encoding: str, sep: str, is_excel: bool) -> int:
-    """Détecte si la 1ère ligne est un groupe d'en-têtes à ignorer.
-    Critère : 1ère ligne a >50 % de cellules vides ET la 2e ligne contient 'Campagne'.
-    """
+def _has_campagne_col(df: pd.DataFrame) -> bool:
+    """Vérifie qu'une des colonnes s'appelle 'Campagne' (insensible à la casse)."""
+    return any("campagne" == str(c).strip().lower() for c in df.columns)
+
+
+def _try_read(raw_bytes: bytes, encoding: str, sep: str,
+              skiprows: int, is_excel: bool):
+    """Tente de lire le fichier avec les paramètres donnés. Retourne None en cas d'échec."""
     try:
         if is_excel:
-            peek = pd.read_excel(io.BytesIO(raw_bytes), nrows=3, dtype=str, header=None)
+            df = pd.read_excel(io.BytesIO(raw_bytes), skiprows=skiprows, dtype=str)
         else:
-            peek = pd.read_csv(io.BytesIO(raw_bytes), sep=sep, nrows=3,
-                               encoding=encoding, dtype=str,
-                               header=None, on_bad_lines="skip")
-        if len(peek) < 2:
-            return 0
-        row0 = peek.iloc[0].astype(str).str.strip()
-        empty_ratio = (row0.isin(["", "nan"])).sum() / len(row0)
-        row1_has_campagne = any("campagne" in str(v).lower() for v in peek.iloc[1])
-        return 1 if empty_ratio > 0.4 and row1_has_campagne else 0
+            df = pd.read_csv(
+                io.BytesIO(raw_bytes),
+                sep=sep,
+                skiprows=skiprows,
+                encoding=encoding,
+                on_bad_lines="skip",
+                dtype=str,
+            )
+        return df if df is not None and not df.empty else None
     except Exception:
-        return 1
+        return None
 
 
 @st.cache_data(show_spinner="Chargement des données…")
@@ -187,52 +191,32 @@ def load_data(raw_bytes: bytes, filename: str) -> pd.DataFrame:
     df = None
 
     for enc in ["utf-8-sig", "utf-8", "cp1252", "iso-8859-1"]:
-        try:
-            if is_excel:
-                skip = _detect_skiprows(raw_bytes, enc, ",", True)
-                df = pd.read_excel(io.BytesIO(raw_bytes), skiprows=skip, dtype=str)
-            else:
-                sep  = _detect_separator(raw_bytes, enc)
-                skip = _detect_skiprows(raw_bytes, enc, sep, False)
-                df = pd.read_csv(
-                    io.BytesIO(raw_bytes),
-                    sep=sep,
-                    skiprows=skip,
-                    encoding=enc,
-                    on_bad_lines="skip",
-                    dtype=str,
-                )
-            if df is not None and not df.empty:
+        sep = _detect_separator(raw_bytes, enc) if not is_excel else ","
+        # On essaie skiprows=1 en premier (cas le plus fréquent : ligne de groupe),
+        # puis skiprows=0. On garde la lecture qui produit une colonne "Campagne".
+        for skip in [1, 0]:
+            candidate = _try_read(raw_bytes, enc, sep, skip, is_excel)
+            if candidate is None:
+                continue
+            candidate.columns = [str(c).strip() for c in candidate.columns]
+            # Supprimer colonne vide en tête
+            if str(candidate.columns[0]).strip() in ("", "nan") or \
+               str(candidate.columns[0]).startswith("Unnamed"):
+                candidate = candidate.iloc[:, 1:]
+                candidate.columns = [str(c).strip() for c in candidate.columns]
+            candidate = candidate.rename(columns=_EXACT_COL_MAP)
+            if _has_campagne_col(candidate):
+                df = candidate
                 break
-        except Exception:
-            continue
+        if df is not None:
+            break
 
     if df is None or df.empty:
         st.error("Impossible de lire le fichier. Vérifie qu'il est au format CSV ou Excel.")
         return pd.DataFrame()
 
-    # ── Nettoyage structurel ───────────────────────────────────────────────────
-    # Supprimer les colonnes entièrement vides
-    df = df.dropna(how="all", axis=1)
-
-    # Supprimer la colonne de tête si elle est vide / sans nom
-    if str(df.columns[0]).strip() in ("", "nan") or str(df.columns[0]).startswith("Unnamed"):
-        df = df.iloc[:, 1:]
-
-    # Strip des espaces dans les noms de colonnes
-    df.columns = [str(c).strip() for c in df.columns]
-
-    # ── Renommage via mapping exact ────────────────────────────────────────────
-    df = df.rename(columns=_EXACT_COL_MAP)
-
-    # ── Supprimer lignes vides / parasites ─────────────────────────────────────
+    # ── Supprimer lignes vides / parasites ────────────────────────────────────
     df = df.dropna(how="all")
-    if "Campagne" not in df.columns:
-        st.error(
-            "Colonne 'Campagne' introuvable après lecture. "
-            "Colonnes détectées : " + ", ".join(df.columns.tolist()[:10])
-        )
-        return pd.DataFrame()
     df = df[~df["Campagne"].astype(str).str.strip().str.lower().isin(["", "nan"])]
 
     # ── Nettoyage des colonnes texte ───────────────────────────────────────────
